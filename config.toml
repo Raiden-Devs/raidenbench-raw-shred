@@ -1,0 +1,16 @@
+[config]
+shreds = 100000
+measure_strat = 32
+shred_type = "coding-data"
+windows = 20
+
+[backend]
+url = "https://bench.api.raiden.wtf"
+
+[[endpoint]]
+name = "Raiden FRA"
+url = "http://0.0.0.0:20001"
+
+[[endpoint]]
+name = "Jito FRA"
+url = "http://0.0.0.0:20000"
