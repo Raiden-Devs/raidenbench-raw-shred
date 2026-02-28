@@ -1266,6 +1266,46 @@ fn parse_addr_from_url(url: &str) -> SocketAddr {
     })
 }
 
+// ─── WebSocket helper ──────────────────────────────────────────────────────
+
+/// Read next text message from the WebSocket, automatically responding to Pings.
+fn ws_read_text(
+    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+) -> Result<String, String> {
+    loop {
+        match socket.read() {
+            Ok(Message::Text(t)) => return Ok(t),
+            Ok(Message::Ping(data)) => {
+                let _ = socket.send(Message::Pong(data));
+                continue;
+            }
+            Ok(Message::Pong(_)) => continue,
+            Ok(Message::Close(frame)) => {
+                return Err(format!("Connection closed by backend: {:?}", frame));
+            }
+            Ok(other) => {
+                return Err(format!("Unexpected message: {:?}", other));
+            }
+            Err(e) => {
+                return Err(format!("WebSocket read error: {}", e));
+            }
+        }
+    }
+}
+
+/// Enable TCP_NODELAY on the underlying WebSocket stream to disable Nagle's algorithm.
+fn set_tcp_nodelay(
+    socket: &tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+) {
+    use tungstenite::stream::MaybeTlsStream;
+    let tcp = match socket.get_ref() {
+        MaybeTlsStream::Plain(s) => s,
+        MaybeTlsStream::Rustls(s) => s.get_ref(),
+        _ => return,
+    };
+    let _ = tcp.set_nodelay(true);
+}
+
 // ─── Backend upload via WebSocket ──────────────────────────────────────────
 
 fn upload_to_backend(
@@ -1281,7 +1321,6 @@ fn upload_to_backend(
         backend_url.bright_white()
     );
 
-    // Build the WebSocket URL: http(s)://host -> ws(s)://host/ws/benchmark
     let ws_url = {
         let base = backend_url.trim_end_matches('/');
         let ws_base = if base.starts_with("https://") {
@@ -1316,6 +1355,9 @@ fn upload_to_backend(
         }
     };
 
+    // Disable Nagle's algorithm for lower latency writes
+    set_tcp_nodelay(&socket);
+
     println!(
         "  {} Connected to backend",
         "✓".bright_green()
@@ -1341,23 +1383,14 @@ fn upload_to_backend(
     }
 
     // ── Step 2: Read "start_ack" ──
-    let ack_msg = match socket.read() {
-        Ok(msg) => msg,
+    let ack_text = match ws_read_text(&mut socket) {
+        Ok(t) => t,
         Err(e) => {
             eprintln!("  {} Failed to read start_ack: {}", "✗".bright_red(), e);
             return;
         }
     };
 
-    let ack_text = match ack_msg {
-        Message::Text(t) => t,
-        _ => {
-            eprintln!("  {} Unexpected message type from backend", "✗".bright_red());
-            return;
-        }
-    };
-
-    // Check if it's an error
     let type_check: WsTypeCheck = match serde_json::from_str(&ack_text) {
         Ok(t) => t,
         Err(e) => {
@@ -1380,7 +1413,6 @@ fn upload_to_backend(
         }
     };
 
-    // Parse session nonce (hex string -> 32 bytes)
     let nonce_bytes = match hex::decode(&ack.session_nonce) {
         Ok(b) if b.len() == 32 => {
             let mut arr = [0u8; 32];
@@ -1407,19 +1439,24 @@ fn upload_to_backend(
         ack.run_id.bright_cyan()
     );
 
-    // ── Step 3: Stream shred observations with BLAKE3 proofs ──
-    // For each shred that was observed by multiple endpoints, compute the time_diff_ms
-    // relative to the global first arrival, compute the BLAKE3 proof, and send.
+    // ── Step 3: Stream shred observations with batched flushing ──
+    //
+    // Instead of socket.send() (which flushes after every message = 1 syscall per shred),
+    // we use socket.write() to buffer messages and flush every FLUSH_EVERY messages.
+    // With 500k shreds this reduces syscalls from 500k to ~500, massive speedup.
     println!(
         "  {} Uploading shred diffs...",
         "⏳".bright_yellow()
     );
 
+    const FLUSH_EVERY: u64 = 1000;
+
     let total_unique = global_first.len() as u64;
     let mut sent_shreds: u64 = 0;
+    let mut unflushed: u64 = 0;
     let mut last_progress = Instant::now();
+    let upload_start = Instant::now();
 
-    // Collect all shred IDs for deterministic ordering
     let mut all_shred_ids: Vec<&ShredId> = global_first.keys().collect();
     all_shred_ids.sort_by(|a, b| a.cmp(b));
 
@@ -1452,17 +1489,40 @@ fn upload_to_backend(
             };
 
             let json = serde_json::to_string(&shred_msg).unwrap();
-            if let Err(e) = socket.send(Message::Text(json)) {
-                eprintln!("  {} Failed to send shred: {}", "✗".bright_red(), e);
+            // write() buffers without flushing — much faster than send()
+            if let Err(e) = socket.write(Message::Text(json)) {
+                eprintln!("  {} Failed to write shred: {}", "✗".bright_red(), e);
                 return;
             }
 
             sent_shreds += 1;
+            unflushed += 1;
+
+            // Flush in batches
+            if unflushed >= FLUSH_EVERY {
+                if let Err(e) = socket.flush() {
+                    eprintln!("  {} Failed to flush: {}", "✗".bright_red(), e);
+                    return;
+                }
+                unflushed = 0;
+            }
         }
 
-        // Send progress every 2 seconds
+        // Progress every 2 seconds
         if last_progress.elapsed() >= Duration::from_secs(2) {
+            // Flush before sending progress so backend stays up to date
+            if unflushed > 0 {
+                if let Err(e) = socket.flush() {
+                    eprintln!("  {} Failed to flush: {}", "✗".bright_red(), e);
+                    return;
+                }
+                unflushed = 0;
+            }
+
             let pct = (sent_shreds * 100) / total_unique.max(1);
+            let elapsed_s = upload_start.elapsed().as_secs_f64();
+            let rate = sent_shreds as f64 / elapsed_s;
+            let remaining = (total_unique - sent_shreds) as f64 / rate;
 
             let progress_msg = WsProgressMessage {
                 r#type: "progress".to_string(),
@@ -1478,20 +1538,35 @@ fn upload_to_backend(
             }
 
             eprint!(
-                "\r\x1b[2K  📡 Uploading: {}/{} ({}%)",
+                "\r\x1b[2K  📡 Uploading: {}/{} ({}%) — {:.0} shreds/s, ~{:.0}s remaining",
                 sent_shreds.to_string().bright_green(),
                 total_unique.to_string().dimmed(),
-                pct
+                pct,
+                rate,
+                remaining,
             );
 
             last_progress = Instant::now();
         }
     }
 
-    eprintln!();
+    // Final flush for any remaining buffered messages
+    if unflushed > 0 {
+        if let Err(e) = socket.flush() {
+            eprintln!("  {} Failed to flush: {}", "✗".bright_red(), e);
+            return;
+        }
+    }
+
+    let upload_elapsed = upload_start.elapsed();
+    eprintln!(
+        "\r\x1b[2K  📡 Uploaded {} shreds in {:.1}s ({:.0} shreds/s)",
+        sent_shreds.to_string().bright_green(),
+        upload_elapsed.as_secs_f64(),
+        sent_shreds as f64 / upload_elapsed.as_secs_f64(),
+    );
 
     // ── Step 4: Send "end" message with final stats ──
-    // Count common shreds (seen by all endpoints) for win rate denominator
     let common_count = global_first.keys()
         .filter(|sid| all_stats.iter().all(|st| st.shreds.contains_key(*sid)))
         .count() as f64;
@@ -1547,41 +1622,39 @@ fn upload_to_backend(
     }
 
     // ── Step 5: Read "complete" response ──
-    match socket.read() {
-        Ok(Message::Text(text)) => {
-            let type_check: WsTypeCheck = match serde_json::from_str(&text) {
-                Ok(t) => t,
-                Err(_) => {
-                    eprintln!("  {} Invalid response from backend", "✗".bright_red());
-                    return;
-                }
-            };
-
-            if type_check.r#type == "error" {
-                if let Ok(err_msg) = serde_json::from_str::<WsErrorMessage>(&text) {
-                    eprintln!("  {} Backend error: {}", "✗".bright_red(), err_msg.message);
-                }
-                return;
-            }
-
-            if let Ok(complete) = serde_json::from_str::<WsCompleteMessage>(&text) {
-                println!(
-                    "  {} Benchmark uploaded successfully!",
-                    "✓".bright_green()
-                );
-                println!(
-                    "  {} View results at: {}",
-                    "🔗".bright_cyan(),
-                    complete.url.bright_white()
-                );
-            }
-        }
-        Ok(_) => {
-            eprintln!("  {} Unexpected response from backend", "✗".bright_red());
-        }
+    let complete_text = match ws_read_text(&mut socket) {
+        Ok(t) => t,
         Err(e) => {
-            eprintln!("  {} Failed to read complete: {}", "✗".bright_red(), e);
+            eprintln!("  {} {}", "✗".bright_red(), e);
+            return;
         }
+    };
+
+    let type_check: WsTypeCheck = match serde_json::from_str(&complete_text) {
+        Ok(t) => t,
+        Err(_) => {
+            eprintln!("  {} Invalid response from backend", "✗".bright_red());
+            return;
+        }
+    };
+
+    if type_check.r#type == "error" {
+        if let Ok(err_msg) = serde_json::from_str::<WsErrorMessage>(&complete_text) {
+            eprintln!("  {} Backend error: {}", "✗".bright_red(), err_msg.message);
+        }
+        return;
+    }
+
+    if let Ok(complete) = serde_json::from_str::<WsCompleteMessage>(&complete_text) {
+        println!(
+            "  {} Benchmark uploaded successfully!",
+            "✓".bright_green()
+        );
+        println!(
+            "  {} View results at: {}",
+            "🔗".bright_cyan(),
+            complete.url.bright_white()
+        );
     }
 
     let _ = socket.close(None);
