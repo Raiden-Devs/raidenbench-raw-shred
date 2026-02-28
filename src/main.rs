@@ -1043,8 +1043,9 @@ fn print_head_to_head(endpoints: &[Endpoint], all_stats: &[LocalStats], num_wind
     print_time_consistency(&time_deltas, &endpoints[0].name, &endpoints[1].name, num_windows);
 }
 
-/// Visual histogram of head-to-head deltas.
-/// Negative = B faster, Positive = A faster.
+/// Visual butterfly histogram of head-to-head deltas.
+/// Red bars grow LEFT (B faster), green bars grow RIGHT (A faster).
+/// Percentage column is always perfectly centered.
 fn print_histogram(deltas_us: &[f64], name_a: &str, name_b: &str) {
     if deltas_us.is_empty() {
         return;
@@ -1054,12 +1055,7 @@ fn print_histogram(deltas_us: &[f64], name_a: &str, name_b: &str) {
         "\n  {}",
         "LATENCY DISTRIBUTION".bold().bright_white()
     );
-    println!("  {}", "─".repeat(76));
-    println!(
-        "  ◄ {} faster                                          {} faster ►\n",
-        name_b.bright_red(),
-        name_a.bright_green()
-    );
+    println!("  {}", "─".repeat(90));
 
     // Buckets (µs): negative = B faster, positive = A faster
     let bucket_edges: &[f64] = &[
@@ -1085,7 +1081,7 @@ fn print_histogram(deltas_us: &[f64], name_a: &str, name_b: &str) {
 
     let total = deltas_us.len() as f64;
     let max_count = *counts.iter().max().unwrap_or(&1) as f64;
-    let bar_width: usize = 35;
+    let bar_max: usize = 25; // max bar length on each side
 
     let fmt_edge = |v: f64| -> String {
         let abs = v.abs();
@@ -1099,12 +1095,12 @@ fn print_histogram(deltas_us: &[f64], name_a: &str, name_b: &str) {
     let labels: Vec<String> = (0..=bucket_edges.len())
         .map(|i| {
             if i == 0 {
-                format!("    < {}", fmt_edge(bucket_edges[0]))
+                format!("< {}", fmt_edge(bucket_edges[0]))
             } else if i == bucket_edges.len() {
-                format!("    > {}", fmt_edge(bucket_edges[bucket_edges.len() - 1]))
+                format!("> {}", fmt_edge(bucket_edges[bucket_edges.len() - 1]))
             } else {
                 format!(
-                    "{:>8} .. {:<8}",
+                    "{} .. {}",
                     fmt_edge(bucket_edges[i - 1]),
                     fmt_edge(bucket_edges[i])
                 )
@@ -1112,7 +1108,22 @@ fn print_histogram(deltas_us: &[f64], name_a: &str, name_b: &str) {
         })
         .collect();
 
-    let max_label = labels.iter().map(|l| l.len()).max().unwrap_or(10);
+    let label_w = labels.iter().map(|l| l.len()).max().unwrap_or(10);
+
+    // Header: place names centered over bar areas
+    println!(
+        "  {:>lw$}  {:>bw$}        {:<bw$}",
+        "",
+        format!("◄ {} faster", name_b).bright_red(),
+        format!("{} faster ►", name_a).bright_green(),
+        lw = label_w,
+        bw = bar_max,
+    );
+    println!();
+
+    // Fixed-column layout per row:
+    //   "  " + label(label_w) + "  " + left_bar(bar_max) + " " + pct(5.1%=6ch) + " " + right_bar(bar_max) + "  " + count
+    // Every field has a fixed width, so pct is ALWAYS at the exact same column.
 
     for (i, label) in labels.iter().enumerate() {
         let count = counts[i];
@@ -1120,13 +1131,10 @@ fn print_histogram(deltas_us: &[f64], name_a: &str, name_b: &str) {
             continue;
         }
         let pct = count as f64 / total * 100.0;
-        let bar_len = ((count as f64 / max_count) * bar_width as f64).ceil() as usize;
+        let bar_len = ((count as f64 / max_count) * bar_max as f64).ceil() as usize;
         let bar_len = bar_len.max(1);
 
-        let bar = "█".repeat(bar_len);
-
-        // Determine if this bucket represents B faster (negative) or A faster (positive)
-        let is_b_faster = if i == 0 {
+        let is_left = if i == 0 {
             true
         } else if i < bucket_edges.len() {
             bucket_edges[i - 1] < 0.0
@@ -1134,21 +1142,28 @@ fn print_histogram(deltas_us: &[f64], name_a: &str, name_b: &str) {
             false
         };
 
-        let colored_bar = if is_b_faster {
-            bar.bright_red()
-        } else if i > 0 && bucket_edges.get(i - 1).map_or(false, |&e| e == 0.0) {
-            bar.bright_green()
+        // Build display strings: plain spaces + colored bars, always exactly bar_max visible chars
+        let left_display: String;
+        let right_display: String;
+
+        if is_left {
+            let pad = bar_max - bar_len;
+            left_display = format!("{}{}", " ".repeat(pad), "█".repeat(bar_len).bright_red());
+            right_display = " ".repeat(bar_max);
         } else {
-            bar.bright_green()
-        };
+            left_display = " ".repeat(bar_max);
+            let trail = bar_max - bar_len;
+            right_display = format!("{}{}", "█".repeat(bar_len).bright_green(), " ".repeat(trail));
+        }
 
         println!(
-            "  {:>width$} {:>6.1}% {} {}",
+            "  {:>lw$}  {} {:>5.1}% {}  {}",
             label,
+            left_display,
             pct,
-            colored_bar,
+            right_display,
             format!("({})", count).dimmed(),
-            width = max_label
+            lw = label_w,
         );
     }
 }
