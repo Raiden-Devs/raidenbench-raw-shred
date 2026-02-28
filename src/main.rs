@@ -435,6 +435,8 @@ struct LocalStats {
     size_counts: HashMap<usize, u64>,
     /// Shred variant type distribution
     type_counts: HashMap<&'static str, u64>,
+    /// Cross-tabulation: (variant_name, size) -> count
+    size_type_counts: HashMap<(&'static str, usize), u64>,
 }
 
 impl LocalStats {
@@ -447,6 +449,7 @@ impl LocalStats {
             reject_samples: Vec::new(),
             size_counts: HashMap::new(),
             type_counts: HashMap::new(),
+            size_type_counts: HashMap::new(),
         }
     }
 
@@ -649,9 +652,12 @@ fn receiver_thread(
                     continue;
                 }
 
-                // Track packet size and type
+                let vname = variant_name(buf[VARIANT_OFFSET]);
+
+                // Track packet size, type, and size×type cross-tabulation
                 *stats.size_counts.entry(n).or_insert(0) += 1;
-                *stats.type_counts.entry(variant_name(buf[VARIANT_OFFSET])).or_insert(0) += 1;
+                *stats.type_counts.entry(vname).or_insert(0) += 1;
+                *stats.size_type_counts.entry((vname, n)).or_insert(0) += 1;
 
                 // Apply shred filter (no-op when ShredFilter::All)
                 if !matches!(filter, ShredFilter::All) {
@@ -793,6 +799,40 @@ fn print_results(endpoints: &[Endpoint], all_stats: &[LocalStats], elapsed: Dura
                 );
             }
             println!();
+        }
+
+        // Show size × type cross-tabulation (only if there are multiple sizes)
+        if st.size_counts.len() > 1 && !st.size_type_counts.is_empty() {
+            // Group by type, then list sizes within each type
+            let mut by_type: HashMap<&'static str, Vec<(usize, u64)>> = HashMap::new();
+            for (&(vname, size), &count) in &st.size_type_counts {
+                by_type.entry(vname).or_default().push((size, count));
+            }
+            // Sort types by total count descending
+            let mut type_list: Vec<_> = by_type.into_iter().collect();
+            type_list.sort_by(|a, b| {
+                let sum_a: u64 = a.1.iter().map(|(_, c)| c).sum();
+                let sum_b: u64 = b.1.iter().map(|(_, c)| c).sum();
+                sum_b.cmp(&sum_a)
+            });
+
+            // Only show this section if at least one type has multiple sizes
+            let has_multi_sizes = type_list.iter().any(|(_, sizes)| sizes.len() > 1);
+            if has_multi_sizes {
+                println!("    {}", "Size by type:".bright_cyan());
+                for (vname, mut sizes) in type_list {
+                    sizes.sort_by_key(|(s, _)| *s);
+                    let parts: Vec<String> = sizes
+                        .iter()
+                        .map(|(s, c)| format!("{} × {}", s, c))
+                        .collect();
+                    println!(
+                        "      {:<30} {}",
+                        vname.bright_white(),
+                        parts.join(",  ").dimmed()
+                    );
+                }
+            }
         }
 
         // Show rejected packet samples if any
