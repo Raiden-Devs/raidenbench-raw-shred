@@ -1085,7 +1085,7 @@ fn print_head_to_head(endpoints: &[Endpoint], all_stats: &[LocalStats], num_wind
 
 /// Visual butterfly histogram of head-to-head deltas.
 /// Red bars grow LEFT (B faster), green bars grow RIGHT (A faster).
-/// Percentage column is always perfectly centered.
+/// Percentage column is always perfectly centered
 fn print_histogram(deltas_us: &[f64], name_a: &str, name_b: &str) {
     if deltas_us.is_empty() {
         return;
