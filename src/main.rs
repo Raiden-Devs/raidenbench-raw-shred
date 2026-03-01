@@ -150,9 +150,54 @@ struct WsProgressMessage {
 }
 
 #[derive(Serialize)]
+struct WsShredBatchMessage {
+    r#type: String,
+    shreds: Vec<WsShredEntry>,
+}
+
+#[derive(Serialize)]
+struct WsShredEntry {
+    shred_id: String,
+    observations: Vec<WsShredObservation>,
+}
+
+#[derive(Serialize)]
 struct WsEndMessage {
     r#type: String,
     endpoints: Vec<WsEndpointResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    head_to_head: Option<WsHeadToHead>,
+}
+
+#[derive(Serialize)]
+struct WsHeadToHead {
+    winner: String,
+    loser: String,
+    common_count: u64,
+    a_faster: u64,
+    b_faster: u64,
+    ties: u64,
+    total_duration_secs: f64,
+    consistency_windows: Vec<WsConsistencyWindow>,
+    histogram_buckets: Vec<WsHistogramBucket>,
+}
+
+#[derive(Serialize)]
+struct WsConsistencyWindow {
+    label: String,
+    p50: f64,
+    p95: f64,
+    p99: f64,
+    win_pct: f64,
+    count: usize,
+}
+
+#[derive(Serialize)]
+struct WsHistogramBucket {
+    label: String,
+    count: u64,
+    pct: f64,
+    is_negative: bool,
 }
 
 #[derive(Serialize)]
@@ -1494,21 +1539,20 @@ fn upload_to_backend(
         ack.run_id.bright_cyan()
     );
 
-    // ── Step 3: Stream shred observations with batched flushing ──
+    // ── Step 3: Stream shred observations in batches ──
     //
-    // Instead of socket.send() (which flushes after every message = 1 syscall per shred),
-    // we use socket.write() to buffer messages and flush every FLUSH_EVERY messages.
-    // With 500k shreds this reduces syscalls from 500k to ~500, massive speedup.
+    // Send 250 shreds per "shred_batch" message, using write()+flush() for
+    // buffered I/O. This reduces 500K individual messages to ~2K batch messages.
     println!(
         "  {} Uploading shred diffs...",
         "⏳".bright_yellow()
     );
 
-    const FLUSH_EVERY: u64 = 1000;
+    const BATCH_SIZE: usize = 250;
 
     let total_unique = global_first.len() as u64;
     let mut sent_shreds: u64 = 0;
-    let mut unflushed: u64 = 0;
+    let mut batch: Vec<WsShredEntry> = Vec::with_capacity(BATCH_SIZE);
     let mut last_progress = Instant::now();
     let upload_start = Instant::now();
 
@@ -1537,43 +1581,28 @@ fn upload_to_backend(
         }
 
         if !observations.is_empty() {
-            let shred_msg = WsShredMessage {
-                r#type: "shred".to_string(),
+            batch.push(WsShredEntry {
                 shred_id: shred_id_hex,
                 observations,
-            };
-
-            let json = serde_json::to_string(&shred_msg).unwrap();
-            // write() buffers without flushing — much faster than send()
-            if let Err(e) = socket.write(Message::Text(json)) {
-                eprintln!("  {} Failed to write shred: {}", "✗".bright_red(), e);
-                return;
-            }
-
+            });
             sent_shreds += 1;
-            unflushed += 1;
+        }
 
-            // Flush in batches
-            if unflushed >= FLUSH_EVERY {
-                if let Err(e) = socket.flush() {
-                    eprintln!("  {} Failed to flush: {}", "✗".bright_red(), e);
-                    return;
-                }
-                unflushed = 0;
+        // Flush batch when full
+        if batch.len() >= BATCH_SIZE {
+            let batch_msg = WsShredBatchMessage {
+                r#type: "shred_batch".to_string(),
+                shreds: std::mem::replace(&mut batch, Vec::with_capacity(BATCH_SIZE)),
+            };
+            let json = serde_json::to_string(&batch_msg).unwrap();
+            if let Err(e) = socket.send(Message::Text(json)) {
+                eprintln!("  {} Failed to send shred batch: {}", "✗".bright_red(), e);
+                return;
             }
         }
 
         // Progress every 2 seconds
         if last_progress.elapsed() >= Duration::from_secs(2) {
-            // Flush before sending progress so backend stays up to date
-            if unflushed > 0 {
-                if let Err(e) = socket.flush() {
-                    eprintln!("  {} Failed to flush: {}", "✗".bright_red(), e);
-                    return;
-                }
-                unflushed = 0;
-            }
-
             let pct = (sent_shreds * 100) / total_unique.max(1);
             let elapsed_s = upload_start.elapsed().as_secs_f64();
             let rate = sent_shreds as f64 / elapsed_s;
@@ -1605,10 +1634,15 @@ fn upload_to_backend(
         }
     }
 
-    // Final flush for any remaining buffered messages
-    if unflushed > 0 {
-        if let Err(e) = socket.flush() {
-            eprintln!("  {} Failed to flush: {}", "✗".bright_red(), e);
+    // Flush remaining shreds
+    if !batch.is_empty() {
+        let batch_msg = WsShredBatchMessage {
+            r#type: "shred_batch".to_string(),
+            shreds: batch,
+        };
+        let json = serde_json::to_string(&batch_msg).unwrap();
+        if let Err(e) = socket.send(Message::Text(json)) {
+            eprintln!("  {} Failed to send final shred batch: {}", "✗".bright_red(), e);
             return;
         }
     }
@@ -1665,9 +1699,141 @@ fn upload_to_backend(
         });
     }
 
+    // ── Compute head-to-head data for 2-endpoint benchmarks ──
+    let head_to_head = if endpoints.len() == 2 {
+        let map_a = &all_stats[0].shreds;
+        let map_b = &all_stats[1].shreds;
+
+        let mut a_faster: u64 = 0;
+        let mut b_faster: u64 = 0;
+        let mut ties: u64 = 0;
+        let mut time_deltas: Vec<(u64, f64)> = Vec::new();
+        let mut deltas_us: Vec<f64> = Vec::new();
+
+        for (shred_id, ts_a) in map_a {
+            if let Some(ts_b) = map_b.get(shred_id) {
+                let diff = *ts_b as i128 - *ts_a as i128;
+                let delta = diff as f64 / 1_000.0;
+                deltas_us.push(delta);
+                time_deltas.push((*ts_a, delta));
+                if diff > 0 { a_faster += 1; }
+                else if diff < 0 { b_faster += 1; }
+                else { ties += 1; }
+            }
+        }
+
+        let common = a_faster + b_faster + ties;
+
+        if common > 0 {
+            deltas_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let p50 = percentile(&deltas_us, 50.0);
+
+            let (winner, loser) = if p50 >= 0.0 {
+                (endpoints[0].name.clone(), endpoints[1].name.clone())
+            } else {
+                (endpoints[1].name.clone(), endpoints[0].name.clone())
+            };
+
+            // Consistency windows
+            let mut sorted_td = time_deltas.clone();
+            sorted_td.sort_by(|a, b| a.0.cmp(&b.0));
+            let first_ts = sorted_td.first().unwrap().0;
+            let last_ts = sorted_td.last().unwrap().0;
+            let total_duration_secs = (last_ts - first_ts) as f64 / 1e9;
+
+            let num_windows = config.windows.max(1);
+            let window_size = sorted_td.len() / num_windows;
+            let mut consistency_windows = Vec::new();
+
+            if window_size > 0 {
+                for w in 0..num_windows {
+                    let start_idx = w * window_size;
+                    let end_idx = if w == num_windows - 1 { sorted_td.len() } else { (w + 1) * window_size };
+                    let window = &sorted_td[start_idx..end_idx];
+
+                    let mut vals: Vec<f64> = window.iter().map(|(_, d)| *d).collect();
+                    vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+                    let wn = vals.len() as f64;
+                    let w_a_wins = window.iter().filter(|(_, d)| *d > 0.0).count() as f64;
+
+                    let ws = (window.first().unwrap().0 - first_ts) as f64 / 1e9;
+                    let we = (window.last().unwrap().0 - first_ts) as f64 / 1e9;
+
+                    consistency_windows.push(WsConsistencyWindow {
+                        label: format!("{:.0}-{:.0}s", ws, we),
+                        p50: percentile(&vals, 50.0).abs() / 1000.0,
+                        p95: percentile(&vals, 95.0).abs() / 1000.0,
+                        p99: percentile(&vals, 99.0).abs() / 1000.0,
+                        win_pct: w_a_wins / wn * 100.0,
+                        count: vals.len(),
+                    });
+                }
+            }
+
+            // Histogram buckets
+            let bucket_edges: &[f64] = &[
+                -50000.0, -20000.0, -10000.0, -5000.0, -2000.0, -1000.0, -500.0,
+                0.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0, 20000.0, 50000.0,
+            ];
+            let mut counts = vec![0u64; bucket_edges.len() + 1];
+            for &d in &deltas_us {
+                let mut placed = false;
+                for (i, &edge) in bucket_edges.iter().enumerate() {
+                    if d < edge { counts[i] += 1; placed = true; break; }
+                }
+                if !placed { counts[bucket_edges.len()] += 1; }
+            }
+
+            let total_f = deltas_us.len() as f64;
+            let fmt_edge = |v: f64| -> String {
+                let abs = v.abs();
+                if abs < 1000.0 { format!("{:.0}µs", v) } else { format!("{:.0}ms", v / 1000.0) }
+            };
+
+            let mut histogram_buckets = Vec::new();
+            for i in 0..=bucket_edges.len() {
+                if counts[i] == 0 { continue; }
+                let label = if i == 0 {
+                    format!("< {}", fmt_edge(bucket_edges[0]))
+                } else if i == bucket_edges.len() {
+                    format!("> {}", fmt_edge(bucket_edges[bucket_edges.len() - 1]))
+                } else {
+                    format!("{} .. {}", fmt_edge(bucket_edges[i - 1]), fmt_edge(bucket_edges[i]))
+                };
+                let is_negative = if i == 0 { true }
+                    else if i < bucket_edges.len() { bucket_edges[i - 1] < 0.0 }
+                    else { false };
+                histogram_buckets.push(WsHistogramBucket {
+                    label,
+                    count: counts[i],
+                    pct: counts[i] as f64 / total_f * 100.0,
+                    is_negative,
+                });
+            }
+
+            Some(WsHeadToHead {
+                winner,
+                loser,
+                common_count: common,
+                a_faster,
+                b_faster,
+                ties,
+                total_duration_secs,
+                consistency_windows,
+                histogram_buckets,
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let end_msg = WsEndMessage {
         r#type: "end".to_string(),
         endpoints: ws_endpoints,
+        head_to_head,
     };
 
     let end_json = serde_json::to_string(&end_msg).unwrap();
@@ -1826,6 +1992,12 @@ fn main() {
 
     // ─── Progress monitor (main thread, reads atomics only — never blocks receivers) ───
     let start = Instant::now();
+    let mut prev_counts: Vec<u64> = vec![0; num_endpoints];
+    let mut last_changed: Vec<Instant> = vec![Instant::now(); num_endpoints];
+    let mut aborted = false;
+    const STALE_TIMEOUT_SECS: u64 = 30;
+    const GRACE_PERIOD_SECS: u64 = 15;
+
     loop {
         thread::sleep(Duration::from_secs(1));
 
@@ -1870,6 +2042,40 @@ fn main() {
             counters.running.store(false, Ordering::Relaxed);
             break;
         }
+
+        // ─── Stale endpoint detection: abort if any endpoint stops receiving ───
+        for i in 0..num_endpoints {
+            let current = counters.unique_counts[i].load(Ordering::Relaxed);
+            if current != prev_counts[i] {
+                prev_counts[i] = current;
+                last_changed[i] = Instant::now();
+            }
+        }
+
+        if start.elapsed().as_secs() >= GRACE_PERIOD_SECS {
+            let now = Instant::now();
+            let stale: Vec<usize> = (0..num_endpoints)
+                .filter(|&i| now.duration_since(last_changed[i]).as_secs() >= STALE_TIMEOUT_SECS)
+                .collect();
+
+            if !stale.is_empty() {
+                let active: Vec<usize> = (0..num_endpoints)
+                    .filter(|&i| now.duration_since(last_changed[i]).as_secs() < STALE_TIMEOUT_SECS)
+                    .collect();
+
+                if active.is_empty() {
+                    eprintln!("\n\n  ⚠️  Aborting — all endpoints stopped receiving shreds");
+                } else {
+                    eprintln!("\n\n  ⚠️  Aborting — endpoint connection lost:");
+                    for &i in &stale {
+                        eprintln!("     ✗ {} — no shreds for {}s", config.endpoint[i].name, STALE_TIMEOUT_SECS);
+                    }
+                }
+                aborted = true;
+                counters.running.store(false, Ordering::Relaxed);
+                break;
+            }
+        }
     }
 
     eprintln!();
@@ -1884,8 +2090,10 @@ fn main() {
     // ─── Print report ───
     print_results(&config.endpoint, &all_stats, elapsed, config.config.windows);
 
-    // ─── Upload to backend if configured ───
-    if let Some(ref backend) = config.backend {
+    // ─── Upload to backend if configured (skip on abort) ───
+    if aborted {
+        eprintln!("  ⚠️  Benchmark aborted — results will not be published.\n");
+    } else if let Some(ref backend) = config.backend {
         // Build global first-arrival map (same as print_results does internally)
         let mut global_first: HashMap<ShredId, u64> = HashMap::new();
         for stats in &all_stats {
